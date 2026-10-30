@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    :root { --rosa: #ec7fa9; --rosa-claro: #fdf1f5; }
+    body { background: var(--rosa-claro); font-family: system-ui, sans-serif; }
+    h1, h2 { color: var(--rosa); }
+    .btn-rosa { background: var(--rosa); color: #fff; border-radius: 20px; }
+    .btn-rosa:hover { background: #d96a96; color: #fff; }
+    .caja { border: 0; border-radius: 16px; box-shadow: 0 4px 16px rgba(236,127,169,.15); }
+    .badge-estado { background: var(--rosa); }
+    .badge-Entregado { background: #43a047; } .badge-Cancelado { background: #e53935; }
+  </style>
+</head>
+<body>
+<div class="container py-4" style="max-width: 820px">
+  <h1 class="h3 mb-3">Panel de pedidos · <?= tienda ?></h1>
+
+  <!-- Acceso -->
+  <div id="vista-login" class="card caja d-none" style="max-width:380px"><div class="card-body">
+    <h2 id="login-titulo" class="h5"></h2>
+    <p id="login-ayuda" class="small text-muted"></p>
+    <form id="form-login">
+      <input id="clave" type="password" class="form-control mb-2" placeholder="Clave" required autocomplete="current-password">
+      <input id="clave2" type="password" class="form-control mb-2 d-none" placeholder="Repite la clave" autocomplete="new-password">
+      <div id="login-error" class="alert alert-danger py-1 d-none"></div>
+      <button class="btn btn-rosa w-100" type="submit">Entrar</button>
+    </form>
+  </div></div>
+
+  <!-- Panel -->
+  <div id="vista-panel" class="d-none">
+    <div class="text-end mb-2"><button id="salir" class="btn btn-sm btn-outline-secondary">Salir</button></div>
+
+    <div class="card caja mb-4"><div class="card-body">
+      <h2 class="h5">Nuevo pedido</h2>
+      <form id="form-nuevo">
+        <div class="mb-2"><label class="form-label mb-0 small">Cliente *</label><input name="cliente" class="form-control" required></div>
+        <div class="row g-2 mb-2">
+          <div class="col-sm"><label class="form-label mb-0 small">Email</label><input name="email" type="email" class="form-control"></div>
+          <div class="col-sm"><label class="form-label mb-0 small">Teléfono</label><input name="telefono" class="form-control"></div>
+        </div>
+        <div class="mb-2"><label class="form-label mb-0 small">Productos *</label><textarea name="productos" rows="3" class="form-control" required></textarea></div>
+        <div class="row g-2 mb-3">
+          <div class="col-sm-4"><label class="form-label mb-0 small">Total</label><input name="total" type="number" min="0" step="any" class="form-control"></div>
+          <div class="col-sm"><label class="form-label mb-0 small">Dirección / ciudad</label><input name="direccion" class="form-control"></div>
+        </div>
+        <div id="nuevo-msg" class="alert py-1 d-none"></div>
+        <button id="btn-nuevo" class="btn btn-rosa" type="submit">Crear pedido</button>
+      </form>
+    </div></div>
+
+    <div class="d-flex gap-2 mb-3">
+      <input id="buscar" class="form-control" placeholder="Buscar por número, cliente o producto">
+      <select id="filtro" class="form-select" style="max-width:190px"></select>
+    </div>
+    <div id="lista"></div>
+  </div>
+</div>
+
+<script>
+  const ESTADOS = <?!= JSON.stringify(estados) ?>;
+  const $ = function (id) { return document.getElementById(id); };
+  let token = null;
+  let pedidos = [];
+  let creandoClave = false;
+
+  try { token = localStorage.getItem('adm_token'); } catch (e) { token = null; }
+
+  function guardarToken(t) {
+    token = t;
+    try { if (t) localStorage.setItem('adm_token', t); else localStorage.removeItem('adm_token'); } catch (e) {}
+  }
+
+  function llamar(nombre, args, ok, fallo) {
+    const r = google.script.run.withSuccessHandler(ok).withFailureHandler(function (e) {
+      if (/SESION/.test(e.message)) { salir(); return; }
+      if (fallo) fallo(e);
+    });
+    r[nombre].apply(r, args);
+  }
+
+  function mostrarLogin() {
+    $('vista-panel').classList.add('d-none');
+    $('vista-login').classList.remove('d-none');
+    llamar('estadoPanel', [], function (s) {
+      creandoClave = !s.claveCreada;
+      $('login-titulo').textContent = creandoClave ? 'Crea tu clave' : 'Entra a tu panel';
+      $('login-ayuda').textContent = creandoClave
+        ? 'Es la primera vez. Elige una clave de al menos 8 caracteres; la usarás siempre para entrar.' : '';
+      $('clave2').classList.toggle('d-none', !creandoClave);
+      $('clave2').required = creandoClave;
+    });
+  }
+
+  function salir() { guardarToken(null); mostrarLogin(); }
+  $('salir').addEventListener('click', salir);
+
+  $('form-login').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    const err = $('login-error');
+    err.classList.add('d-none');
+    if (creandoClave && $('clave').value !== $('clave2').value) {
+      err.textContent = 'Las dos claves no coinciden.';
+      err.classList.remove('d-none');
+      return;
+    }
+    const alEntrar = function (t) { guardarToken(t); $('clave').value = ''; $('clave2').value = ''; abrirPanel(); };
+    const alFallar = function (e) { err.textContent = e.message.replace(/^Error: /, ''); err.classList.remove('d-none'); };
+    llamar(creandoClave ? 'crearClave' : 'iniciarSesion', [$('clave').value], alEntrar, alFallar);
+  });
+
+  function abrirPanel() {
+    $('vista-login').classList.add('d-none');
+    $('vista-panel').classList.remove('d-none');
+    cargar();
+  }
+
+  function cargar() {
+    llamar('listarPedidos', [token], function (lista) { pedidos = lista; dibujar(); });
+  }
+
+  /* ---------- Nuevo pedido ---------- */
+  $('form-nuevo').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    const datos = {};
+    new FormData(ev.target).forEach(function (v, k) { datos[k] = v; });
+    const boton = $('btn-nuevo'), msg = $('nuevo-msg');
+    boton.disabled = true; boton.textContent = 'Guardando…'; msg.classList.add('d-none');
+    llamar('crearPedido', [token, datos], function (r) {
+      boton.disabled = false; boton.textContent = 'Crear pedido';
+      ev.target.reset();
+      msg.className = 'alert alert-success py-1';
+      msg.textContent = 'Pedido ' + r.pedido.id + ' creado. Correo: ' + r.correo;
+      pedidos.unshift(r.pedido);
+      dibujar();
+    }, function (e) {
+      boton.disabled = false; boton.textContent = 'Crear pedido';
+      msg.className = 'alert alert-danger py-1';
+      msg.textContent = e.message.replace(/^Error: /, '');
+    });
+  });
+
+  /* ---------- Lista ---------- */
+  const filtro = $('filtro');
+  [['', 'Todos los estados']].concat(ESTADOS.map(function (e) { return [e, e]; })).forEach(function (par) {
+    const o = document.createElement('option');
+    o.value = par[0]; o.textContent = par[1];
+    filtro.appendChild(o);
+  });
+  filtro.addEventListener('change', dibujar);
+  $('buscar').addEventListener('input', dibujar);
+
+  function el(tag, clase, texto) {
+    const e = document.createElement(tag);
+    if (clase) e.className = clase;
+    if (texto !== undefined) e.textContent = texto;
+    return e;
+  }
+
+  function dibujar() {
+    const q = $('buscar').value.trim().toLowerCase();
+    const est = filtro.value;
+    const lista = $('lista');
+    lista.textContent = '';
+    const visibles = pedidos.filter(function (p) {
+      if (est && p.estado !== est) return false;
+      return !q || (p.id + ' ' + p.cliente + ' ' + p.productos).toLowerCase().indexOf(q) !== -1;
+    });
+    if (!visibles.length) {
+      lista.appendChild(el('p', 'text-muted text-center', 'No hay pedidos para mostrar.'));
+      return;
+    }
+    visibles.forEach(function (p) { lista.appendChild(tarjeta(p)); });
+  }
+
+  function campo(etiqueta, valor, clase) {
+    const col = el('div', clase);
+    col.appendChild(el('label', 'form-label mb-0 small', etiqueta));
+    const input = el('input', 'form-control form-control-sm');
+    input.value = valor;
+    col.appendChild(input);
+    return { col: col, input: input };
+  }
+
+  function tarjeta(p) {
+    const card = el('div', 'card caja mb-3');
+    const body = el('div', 'card-body');
+    card.appendChild(body);
+
+    const cab = el('div', 'd-flex justify-content-between align-items-start mb-1');
+    const izq = el('div');
+    izq.appendChild(el('b', '', p.id + ' · ' + p.cliente));
+    izq.appendChild(el('div', 'small text-muted', p.fecha + (p.total ? ' · $' + p.total.toLocaleString('es-CO') : '')));
+    cab.appendChild(izq);
+    cab.appendChild(el('span', 'badge badge-estado badge-' + p.estado.replace(/\s/g, ''), p.estado));
+    body.appendChild(cab);
+
+    body.appendChild(el('div', 'small', p.productos));
+    const contacto = [p.email, p.telefono, p.direccion].filter(Boolean).join(' · ');
+    if (contacto) body.appendChild(el('div', 'small text-muted mb-2', contacto));
+
+    const fila = el('div', 'row g-2 mt-1');
+    const colEstado = el('div', 'col-sm-4');
+    colEstado.appendChild(el('label', 'form-label mb-0 small', 'Estado'));
+    const select = el('select', 'form-select form-select-sm');
+    ESTADOS.forEach(function (e) {
+      const o = el('option', '', e); o.value = e; if (e === p.estado) o.selected = true; select.appendChild(o);
+    });
+    colEstado.appendChild(select);
+    const transp = campo('Transportadora', p.transportadora, 'col-sm-4');
+    const guia = campo('Guía', p.guia, 'col-sm-4');
+    fila.appendChild(colEstado); fila.appendChild(transp.col); fila.appendChild(guia.col);
+    body.appendChild(fila);
+
+    const nota = campo('Nota para el cliente (la verá en su seguimiento)', p.nota, 'mt-2');
+    body.appendChild(nota.col);
+
+    const pie = el('div', 'd-flex align-items-center gap-2 mt-2');
+    const boton = el('button', 'btn btn-rosa btn-sm', 'Guardar cambios');
+    const msg = el('span', 'small text-muted');
+    pie.appendChild(boton); pie.appendChild(msg);
+    body.appendChild(pie);
+
+    boton.addEventListener('click', function () {
+      boton.disabled = true; msg.textContent = 'Guardando…';
+      llamar('actualizarPedido', [token, p.id, {
+        estado: select.value, transportadora: transp.input.value, guia: guia.input.value, nota: nota.input.value
+      }], function (r) {
+        const i = pedidos.findIndex(function (x) { return x.id === p.id; });
+        if (i !== -1) pedidos[i] = r.pedido;
+        dibujar();
+      }, function (e) {
+        boton.disabled = false; msg.textContent = e.message.replace(/^Error: /, '');
+      });
+    });
+    return card;
+  }
+
+  if (token) abrirPanel(); else mostrarLogin();
+</script>
+</body>
+</html>

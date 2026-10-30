@@ -1,10 +1,10 @@
 /**
  * Seguimiento de pedidos – Mis Angelitos Baby
  *
- * Hoja de cálculo = base de datos. Cada vez que cambias el "Estado" de un pedido:
- *   1. se registra en la hoja Historial,
- *   2. se avisa por correo al cliente,
- *   3. el cliente ve el avance en la página pública de seguimiento (Web App).
+ * Una sola web (Aplicación web de Apps Script):
+ *   - Sin parámetros        → página pública para que el cliente consulte su pedido.
+ *   - ...?p=admin           → panel privado (con clave) para crear y actualizar pedidos.
+ * La hoja de Google Sheets solo hace de base de datos.
  */
 
 const HOJA_PEDIDOS = 'Pedidos';
@@ -21,16 +21,6 @@ const ESTADOS = [
   'Cancelado'
 ];
 
-const COLORES_ESTADO = {
-  'Recibido': '#e8eaf6',
-  'Pago confirmado': '#e0f2f1',
-  'En preparación': '#fff8e1',
-  'Enviado': '#e3f2fd',
-  'En tránsito': '#e1f5fe',
-  'Entregado': '#e8f5e9',
-  'Cancelado': '#ffebee'
-};
-
 const MENSAJES_ESTADO = {
   'Recibido': 'Recibimos tu pedido. En cuanto confirmemos el pago te avisaremos.',
   'Pago confirmado': 'Confirmamos tu pago. ¡Gracias por confiar en nosotros!',
@@ -44,14 +34,13 @@ const MENSAJES_ESTADO = {
 // Posición (1-based) de cada columna en la hoja Pedidos.
 const COL = {
   ID: 1, FECHA: 2, CLIENTE: 3, EMAIL: 4, TELEFONO: 5, PRODUCTOS: 6, TOTAL: 7,
-  DIRECCION: 8, ESTADO: 9, TRANSPORTADORA: 10, GUIA: 11, NOTA: 12,
-  ACTUALIZADO: 13, NOTIFICADO: 14
+  DIRECCION: 8, ESTADO: 9, TRANSPORTADORA: 10, GUIA: 11, NOTA: 12, ACTUALIZADO: 13
 };
 
 const ENCABEZADOS_PEDIDOS = [
   'ID Pedido', 'Fecha', 'Cliente', 'Email', 'Teléfono', 'Productos', 'Total',
   'Dirección / Ciudad', 'Estado', 'Transportadora', 'Guía', 'Nota para el cliente',
-  'Última actualización', 'Estado notificado (automático)'
+  'Última actualización'
 ];
 
 const ENCABEZADOS_HISTORIAL = ['Fecha', 'Pedido', 'Tipo', 'Estado anterior', 'Estado nuevo', 'Nota', 'Correo'];
@@ -63,93 +52,77 @@ const CONFIG_POR_DEFECTO = [
   ['URL_RASTREO_TRANSPORTADORA', '']
 ];
 
-const MAX_INTENTOS_CONSULTA = 8; // por pedido y por hora
+const MAX_INTENTOS_CONSULTA = 8;   // consultas del cliente, por pedido y por hora
+const MAX_INTENTOS_LOGIN = 5;      // intentos de clave del panel, por 15 minutos
+const DURACION_SESION_S = 6 * 3600;
 
 /* ============================== Menú ============================== */
 
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('📦 Pedidos')
-    .addItem('➕ Nuevo pedido', 'mostrarNuevoPedido')
-    .addItem('🔗 Ver enlace de seguimiento', 'mostrarEnlaceSeguimiento')
-    .addSeparator()
-    .addItem('⚙️ Configuración inicial', 'configuracionInicial')
+    .addItem('🔗 Ver enlaces de la web', 'mostrarEnlaces')
     .addToUi();
 }
 
-function mostrarNuevoPedido() {
-  const html = HtmlService.createHtmlOutput(HTML_NUEVO_PEDIDO).setWidth(420).setHeight(560);
-  SpreadsheetApp.getUi().showModalDialog(html, 'Nuevo pedido');
-}
-
-function mostrarEnlaceSeguimiento() {
-  const url = obtenerUrlSeguimiento_();
+function mostrarEnlaces() {
+  const url = obtenerUrlWeb_();
   const ui = SpreadsheetApp.getUi();
   if (!url) {
-    ui.alert('Aún no has publicado la Web App.\n\nVe a Implementar > Nueva implementación > Aplicación web ' +
+    ui.alert('Aún no has publicado la web.\n\nVe a Implementar > Nueva implementación > Aplicación web ' +
       '(Ejecutar como: yo, Acceso: cualquier persona) y vuelve a abrir esta opción.');
     return;
   }
-  ui.alert('Enlace de seguimiento para tus clientes:\n\n' + url);
+  ui.alert('Página para tus clientes:\n' + url + '\n\nPanel de administración (solo tú):\n' + url + '?p=admin');
 }
 
-/* ======================== Configuración inicial ======================== */
+function obtenerUrlWeb_() {
+  try {
+    return ScriptApp.getService().getUrl() || '';
+  } catch (err) {
+    return '';
+  }
+}
 
-function configuracionInicial() {
+/* ===================== Hojas y configuración ===================== */
+
+/** Crea las hojas la primera vez que se usa; no hace falta ejecutar nada a mano. */
+function asegurarHojas_() {
   const ss = SpreadsheetApp.getActive();
 
-  // Pedidos
-  const pedidos = ss.getSheetByName(HOJA_PEDIDOS) || ss.insertSheet(HOJA_PEDIDOS);
-  pedidos.getRange(1, 1, 1, ENCABEZADOS_PEDIDOS.length).setValues([ENCABEZADOS_PEDIDOS])
-    .setFontWeight('bold').setBackground('#f8bbd0').setWrap(true);
-  pedidos.setFrozenRows(1);
-  pedidos.getRange(2, COL.FECHA, 1000, 1).setNumberFormat('dd/MM/yyyy HH:mm');
-  pedidos.getRange(2, COL.ACTUALIZADO, 1000, 1).setNumberFormat('dd/MM/yyyy HH:mm');
-  pedidos.getRange(2, COL.TOTAL, 1000, 1).setNumberFormat('$#,##0');
-  pedidos.getRange(2, COL.NOTIFICADO, 1000, 1).setFontColor('#9e9e9e');
-  pedidos.setColumnWidth(COL.PRODUCTOS, 260);
-  pedidos.setColumnWidth(COL.DIRECCION, 220);
-  pedidos.setColumnWidth(COL.NOTA, 240);
+  let pedidos = ss.getSheetByName(HOJA_PEDIDOS);
+  if (!pedidos) {
+    pedidos = ss.insertSheet(HOJA_PEDIDOS);
+    pedidos.getRange(1, 1, 1, ENCABEZADOS_PEDIDOS.length).setValues([ENCABEZADOS_PEDIDOS])
+      .setFontWeight('bold').setBackground('#f8bbd0').setWrap(true);
+    pedidos.setFrozenRows(1);
+    pedidos.getRange(2, COL.FECHA, 2000, 1).setNumberFormat('dd/MM/yyyy HH:mm');
+    pedidos.getRange(2, COL.ACTUALIZADO, 2000, 1).setNumberFormat('dd/MM/yyyy HH:mm');
+    pedidos.getRange(2, COL.TOTAL, 2000, 1).setNumberFormat('$#,##0');
+    pedidos.getRange(2, COL.TELEFONO, 2000, 1).setNumberFormat('@');
+    pedidos.setColumnWidth(COL.PRODUCTOS, 260);
+    pedidos.setColumnWidth(COL.DIRECCION, 220);
+    pedidos.setColumnWidth(COL.NOTA, 240);
+  }
 
-  const regla = SpreadsheetApp.newDataValidation()
-    .requireValueInList(ESTADOS, true).setAllowInvalid(false).build();
-  pedidos.getRange(2, COL.ESTADO, 1000, 1).setDataValidation(regla);
+  let historial = ss.getSheetByName(HOJA_HISTORIAL);
+  if (!historial) {
+    historial = ss.insertSheet(HOJA_HISTORIAL);
+    historial.getRange(1, 1, 1, ENCABEZADOS_HISTORIAL.length).setValues([ENCABEZADOS_HISTORIAL])
+      .setFontWeight('bold').setBackground('#f8bbd0');
+    historial.setFrozenRows(1);
+    historial.getRange(2, 1, 5000, 1).setNumberFormat('dd/MM/yyyy HH:mm:ss');
+  }
 
-  const rangoEstado = pedidos.getRange(2, COL.ESTADO, 1000, 1);
-  pedidos.setConditionalFormatRules(ESTADOS.map(function (estado) {
-    return SpreadsheetApp.newConditionalFormatRule()
-      .whenTextEqualTo(estado).setBackground(COLORES_ESTADO[estado])
-      .setRanges([rangoEstado]).build();
-  }));
-
-  // Historial
-  const historial = ss.getSheetByName(HOJA_HISTORIAL) || ss.insertSheet(HOJA_HISTORIAL);
-  historial.getRange(1, 1, 1, ENCABEZADOS_HISTORIAL.length).setValues([ENCABEZADOS_HISTORIAL])
-    .setFontWeight('bold').setBackground('#f8bbd0');
-  historial.setFrozenRows(1);
-  historial.getRange(2, 1, 5000, 1).setNumberFormat('dd/MM/yyyy HH:mm:ss');
-
-  // Config
-  let config = ss.getSheetByName(HOJA_CONFIG);
-  if (!config) {
-    config = ss.insertSheet(HOJA_CONFIG);
+  if (!ss.getSheetByName(HOJA_CONFIG)) {
+    const config = ss.insertSheet(HOJA_CONFIG);
     config.getRange(1, 1, 1, 2).setValues([['Clave', 'Valor']]).setFontWeight('bold').setBackground('#f8bbd0');
     config.getRange(2, 1, CONFIG_POR_DEFECTO.length, 2).setValues(CONFIG_POR_DEFECTO);
     config.setColumnWidth(1, 240);
     config.setColumnWidth(2, 360);
   }
-
-  // Disparador instalable (el onEdit simple no puede enviar correos).
-  ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === 'alEditar') ScriptApp.deleteTrigger(t);
-  });
-  ScriptApp.newTrigger('alEditar').forSpreadsheet(ss).onEdit().create();
-
-  SpreadsheetApp.getUi().alert('Listo ✅\n\nSe crearon las hojas Pedidos, Historial y Config, ' +
-    'y se activó el aviso automático al cambiar el Estado de un pedido.');
+  return ss;
 }
-
-/* =========================== Configuración =========================== */
 
 function leerConfig_() {
   const config = {};
@@ -163,83 +136,107 @@ function leerConfig_() {
   return config;
 }
 
-function obtenerUrlSeguimiento_() {
-  try {
-    return ScriptApp.getService().getUrl() || '';
-  } catch (err) {
-    return '';
+/* =========================== Páginas web =========================== */
+
+function doGet(e) {
+  asegurarHojas_();
+  const tienda = leerConfig_().NOMBRE_TIENDA;
+  const admin = e && e.parameter && e.parameter.p === 'admin';
+
+  const plantilla = HtmlService.createTemplate(admin ? HTML_ADMIN : HTML_SEGUIMIENTO);
+  plantilla.tienda = tienda;
+  plantilla.estados = admin ? ESTADOS : ESTADOS.filter(function (x) { return x !== 'Cancelado'; });
+  return plantilla.evaluate()
+    .setTitle((admin ? 'Panel de pedidos · ' : 'Seguimiento de pedido · ') + tienda)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/* ===================== Acceso al panel (clave) ===================== */
+
+function hashClave_(clave, sal) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, sal + clave, Utilities.Charset.UTF_8);
+  return bytes.map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('');
+}
+
+function nuevaSesion_() {
+  const token = Utilities.getUuid();
+  CacheService.getScriptCache().put('adm_' + token, '1', DURACION_SESION_S);
+  return token;
+}
+
+function exigirAdmin_(token) {
+  if (!token || !CacheService.getScriptCache().get('adm_' + token)) throw new Error('SESION');
+}
+
+/** ¿Ya existe una clave? Si no, la página pide crearla. */
+function estadoPanel() {
+  return { claveCreada: !!PropertiesService.getScriptProperties().getProperty('ADMIN_HASH') };
+}
+
+function crearClave(clave) {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('ADMIN_HASH')) throw new Error('La clave ya fue creada.');
+  clave = String(clave || '');
+  if (clave.length < 8) throw new Error('La clave debe tener al menos 8 caracteres.');
+  const sal = Utilities.getUuid();
+  props.setProperties({ ADMIN_SAL: sal, ADMIN_HASH: hashClave_(clave, sal) });
+  return nuevaSesion_();
+}
+
+function iniciarSesion(clave) {
+  const props = PropertiesService.getScriptProperties();
+  const hash = props.getProperty('ADMIN_HASH');
+  if (!hash) throw new Error('Primero crea tu clave.');
+
+  const cache = CacheService.getScriptCache();
+  const intentos = Number(cache.get('login_intentos') || 0);
+  if (intentos >= MAX_INTENTOS_LOGIN) throw new Error('Demasiados intentos. Espera 15 minutos.');
+
+  if (hashClave_(String(clave || ''), props.getProperty('ADMIN_SAL')) !== hash) {
+    cache.put('login_intentos', String(intentos + 1), 900);
+    throw new Error('Clave incorrecta.');
   }
+  cache.remove('login_intentos');
+  return nuevaSesion_();
 }
 
-/* ======================== Edición de la hoja ======================== */
+/* ======================= Funciones del panel ======================= */
 
-/** Disparador instalable onEdit. */
-function alEditar(e) {
-  if (!e || !e.range) return;
-  const hoja = e.range.getSheet();
-  if (hoja.getName() !== HOJA_PEDIDOS) return;
-
-  const primeraFila = Math.max(2, e.range.getRow());
-  const ultimaFila = e.range.getRow() + e.range.getNumRows() - 1;
-  if (ultimaFila < 2) return;
-
-  const c0 = e.range.getColumn();
-  const c1 = c0 + e.range.getNumColumns() - 1;
-  const toca = function (col) { return c0 <= col && c1 >= col; };
-  if (!toca(COL.ESTADO) && !toca(COL.GUIA) && !toca(COL.NOTA) && !toca(COL.TRANSPORTADORA)) return;
-
-  const lock = LockService.getScriptLock();
-  lock.waitLock(15000);
-  try {
-    for (let fila = primeraFila; fila <= ultimaFila; fila++) {
-      procesarFila_(hoja, fila, toca(COL.ESTADO));
-    }
-  } finally {
-    lock.releaseLock();
-  }
+function listarPedidos(token) {
+  exigirAdmin_(token);
+  const ss = asegurarHojas_();
+  const hoja = ss.getSheetByName(HOJA_PEDIDOS);
+  if (hoja.getLastRow() < 2) return [];
+  const tz = ss.getSpreadsheetTimeZone();
+  return hoja.getRange(2, 1, hoja.getLastRow() - 1, ENCABEZADOS_PEDIDOS.length).getValues()
+    .filter(function (f) { return String(f[COL.ID - 1]).trim() !== ''; })
+    .map(function (f) { return pedidoDesdeFila_(f, tz); })
+    .reverse();
 }
 
-function procesarFila_(hoja, fila, cambioEstado) {
-  const v = hoja.getRange(fila, 1, 1, ENCABEZADOS_PEDIDOS.length).getValues()[0];
-  const id = String(v[COL.ID - 1]).trim();
-  if (!id) return;
-
-  const estado = String(v[COL.ESTADO - 1]).trim();
-  const notificado = String(v[COL.NOTIFICADO - 1]).trim();
-  const ahora = new Date();
-
-  if (cambioEstado && estado && estado !== notificado) {
-    const resultadoCorreo = notificarCliente_(v, estado);
-    registrarHistorial_(ahora, id, 'Estado', notificado, estado, String(v[COL.NOTA - 1]), resultadoCorreo);
-    hoja.getRange(fila, COL.NOTIFICADO).setValue(estado);
-  } else {
-    registrarHistorial_(ahora, id, 'Actualización', estado, estado,
-      armarDetalleActualizacion_(v), 'No aplica');
-  }
-  hoja.getRange(fila, COL.ACTUALIZADO).setValue(ahora);
+function pedidoDesdeFila_(f, tz) {
+  const fecha = function (d) {
+    return d instanceof Date ? Utilities.formatDate(d, tz, 'dd/MM/yyyy HH:mm') : '';
+  };
+  return {
+    id: String(f[COL.ID - 1]),
+    fecha: fecha(f[COL.FECHA - 1]),
+    cliente: String(f[COL.CLIENTE - 1]),
+    email: String(f[COL.EMAIL - 1]),
+    telefono: String(f[COL.TELEFONO - 1]),
+    productos: String(f[COL.PRODUCTOS - 1]),
+    total: Number(f[COL.TOTAL - 1]) || 0,
+    direccion: String(f[COL.DIRECCION - 1]),
+    estado: String(f[COL.ESTADO - 1]),
+    transportadora: String(f[COL.TRANSPORTADORA - 1]),
+    guia: String(f[COL.GUIA - 1]),
+    nota: String(f[COL.NOTA - 1]),
+    actualizado: fecha(f[COL.ACTUALIZADO - 1])
+  };
 }
 
-function armarDetalleActualizacion_(v) {
-  const partes = [];
-  const transportadora = String(v[COL.TRANSPORTADORA - 1]).trim();
-  const guia = String(v[COL.GUIA - 1]).trim();
-  const nota = String(v[COL.NOTA - 1]).trim();
-  if (transportadora) partes.push('Transportadora: ' + transportadora);
-  if (guia) partes.push('Guía: ' + guia);
-  if (nota) partes.push(nota);
-  return partes.join(' · ');
-}
-
-function registrarHistorial_(fecha, pedido, tipo, anterior, nuevo, nota, correo) {
-  const hoja = SpreadsheetApp.getActive().getSheetByName(HOJA_HISTORIAL);
-  if (!hoja) return;
-  hoja.appendRow([fecha, pedido, tipo, anterior, nuevo, nota, correo]);
-}
-
-/* ============================ Nuevo pedido ============================ */
-
-/** Llamado desde el diálogo NuevoPedido.html. */
-function crearPedido(datos) {
+function crearPedido(token, datos) {
+  exigirAdmin_(token);
   const cliente = String(datos.cliente || '').trim();
   const email = String(datos.email || '').trim();
   const telefono = String(datos.telefono || '').trim();
@@ -248,18 +245,18 @@ function crearPedido(datos) {
   const direccion = String(datos.direccion || '').trim();
 
   if (!cliente || !productos) throw new Error('El cliente y los productos son obligatorios.');
-  if (!email && !telefono) throw new Error('Indica el email o el teléfono del cliente (se usa para el seguimiento).');
+  if (!email && !telefono) throw new Error('Escribe el email o el teléfono (el cliente lo usa para consultar).');
   if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('El email no es válido.');
 
   const lock = LockService.getScriptLock();
   lock.waitLock(15000);
   try {
-    const hoja = SpreadsheetApp.getActive().getSheetByName(HOJA_PEDIDOS);
-    if (!hoja) throw new Error('Primero ejecuta ⚙️ Configuración inicial.');
-
+    const ss = asegurarHojas_();
+    const hoja = ss.getSheetByName(HOJA_PEDIDOS);
     const id = siguienteId_(hoja);
     const ahora = new Date();
     const estado = ESTADOS[0];
+
     const fila = [];
     fila[COL.ID - 1] = id;
     fila[COL.FECHA - 1] = ahora;
@@ -274,15 +271,71 @@ function crearPedido(datos) {
     fila[COL.GUIA - 1] = '';
     fila[COL.NOTA - 1] = '';
     fila[COL.ACTUALIZADO - 1] = ahora;
-    fila[COL.NOTIFICADO - 1] = estado;
 
     hoja.appendRow(fila);
     const correo = notificarCliente_(fila, estado);
     registrarHistorial_(ahora, id, 'Estado', '', estado, 'Pedido creado', correo);
-    return id;
+    return { pedido: pedidoDesdeFila_(fila, ss.getSpreadsheetTimeZone()), correo: correo };
   } finally {
     lock.releaseLock();
   }
+}
+
+function actualizarPedido(token, id, cambios) {
+  exigirAdmin_(token);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const ss = asegurarHojas_();
+    const hoja = ss.getSheetByName(HOJA_PEDIDOS);
+    const fila = buscarFila_(hoja, id);
+    if (!fila) throw new Error('No se encontró el pedido ' + id);
+
+    const v = hoja.getRange(fila, 1, 1, ENCABEZADOS_PEDIDOS.length).getValues()[0];
+    const estadoAnterior = String(v[COL.ESTADO - 1]);
+    const estado = String(cambios.estado || estadoAnterior);
+    if (ESTADOS.indexOf(estado) === -1) throw new Error('Estado no válido.');
+
+    const transportadora = String(cambios.transportadora || '').trim();
+    const guia = String(cambios.guia || '').trim();
+    const nota = String(cambios.nota || '').trim();
+    const huboCambioDetalle = transportadora !== String(v[COL.TRANSPORTADORA - 1]) ||
+      guia !== String(v[COL.GUIA - 1]) || nota !== String(v[COL.NOTA - 1]);
+
+    v[COL.ESTADO - 1] = estado;
+    v[COL.TRANSPORTADORA - 1] = transportadora;
+    v[COL.GUIA - 1] = guia;
+    v[COL.NOTA - 1] = nota;
+    const ahora = new Date();
+    v[COL.ACTUALIZADO - 1] = ahora;
+
+    let correo = 'No aplica';
+    if (estado !== estadoAnterior) {
+      correo = notificarCliente_(v, estado);
+      registrarHistorial_(ahora, id, 'Estado', estadoAnterior, estado, nota, correo);
+    } else if (huboCambioDetalle) {
+      registrarHistorial_(ahora, id, 'Actualización', estado, estado,
+        [transportadora && 'Transportadora: ' + transportadora, guia && 'Guía: ' + guia, nota]
+          .filter(Boolean).join(' · '), 'No aplica');
+    } else {
+      return { pedido: pedidoDesdeFila_(v, ss.getSpreadsheetTimeZone()), correo: 'Sin cambios' };
+    }
+
+    hoja.getRange(fila, 1, 1, ENCABEZADOS_PEDIDOS.length).setValues([v]);
+    return { pedido: pedidoDesdeFila_(v, ss.getSpreadsheetTimeZone()), correo: correo };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function buscarFila_(hoja, id) {
+  const ultima = hoja.getLastRow();
+  if (ultima < 2) return 0;
+  const ids = hoja.getRange(2, COL.ID, ultima - 1, 1).getValues();
+  for (let i = 0; i < ids.length; i++) {
+    if (String(ids[i][0]).trim().toUpperCase() === String(id).trim().toUpperCase()) return i + 2;
+  }
+  return 0;
 }
 
 function siguienteId_(hoja) {
@@ -297,13 +350,18 @@ function siguienteId_(hoja) {
   return 'MA-' + ('0000' + (max + 1)).slice(-4);
 }
 
+function registrarHistorial_(fecha, pedido, tipo, anterior, nuevo, nota, correo) {
+  const hoja = SpreadsheetApp.getActive().getSheetByName(HOJA_HISTORIAL);
+  if (hoja) hoja.appendRow([fecha, pedido, tipo, anterior, nuevo, nota, correo]);
+}
+
 /* ============================== Correos ============================== */
 
 function notificarCliente_(fila, estado) {
   const config = leerConfig_();
   if (config.NOTIFICAR_CLIENTE.toUpperCase() !== 'SI') return 'Desactivado';
 
-  const email = String(fila[COL.EMAIL - 1]).trim();
+  const email = String(fila[COL.EMAIL - 1] || '').trim();
   if (!email) return 'Sin email';
 
   const tienda = config.NOMBRE_TIENDA;
@@ -311,15 +369,15 @@ function notificarCliente_(fila, estado) {
     id: String(fila[COL.ID - 1]),
     cliente: String(fila[COL.CLIENTE - 1]),
     productos: String(fila[COL.PRODUCTOS - 1]),
-    transportadora: String(fila[COL.TRANSPORTADORA - 1]),
-    guia: String(fila[COL.GUIA - 1]),
-    nota: String(fila[COL.NOTA - 1])
+    transportadora: String(fila[COL.TRANSPORTADORA - 1] || ''),
+    guia: String(fila[COL.GUIA - 1] || ''),
+    nota: String(fila[COL.NOTA - 1] || '')
   };
 
   try {
     const opciones = {
       name: tienda,
-      htmlBody: plantillaCorreo_(pedido, estado, tienda, obtenerUrlSeguimiento_(), config.URL_RASTREO_TRANSPORTADORA)
+      htmlBody: plantillaCorreo_(pedido, estado, tienda, obtenerUrlWeb_(), config.URL_RASTREO_TRANSPORTADORA)
     };
     if (config.EMAIL_RESPUESTA) opciones.replyTo = config.EMAIL_RESPUESTA;
     MailApp.sendEmail(email, tienda + ' · Pedido ' + pedido.id + ': ' + estado,
@@ -347,7 +405,7 @@ function plantillaCorreo_(p, estado, tienda, urlSeguimiento, urlRastreo) {
     botones += '<p><a href="' + esc_(urlSeguimiento) + '" style="background:#ec7fa9;color:#fff;' +
       'padding:10px 18px;border-radius:20px;text-decoration:none;display:inline-block">Ver seguimiento</a></p>';
   }
-  if (urlRastreo && p.guia) {
+  if (/^https?:\/\//i.test(urlRastreo || '') && p.guia) {
     botones += '<p><a href="' + esc_(urlRastreo) + '">Rastrear con la transportadora</a></p>';
   }
 
@@ -365,21 +423,11 @@ function plantillaCorreo_(p, estado, tienda, urlSeguimiento, urlRastreo) {
     esc_(p.id) + ' y tu email o teléfono.</p></div>';
 }
 
-/* ========================= Web App (cliente) ========================= */
-
-function doGet() {
-  const tienda = leerConfig_().NOMBRE_TIENDA;
-  const plantilla = HtmlService.createTemplate(HTML_SEGUIMIENTO);
-  plantilla.tienda = tienda;
-  plantilla.estados = ESTADOS.filter(function (e) { return e !== 'Cancelado'; });
-  return plantilla.evaluate()
-    .setTitle('Seguimiento de pedido · ' + tienda)
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
-}
+/* ====================== Consulta pública (cliente) ====================== */
 
 /**
- * Llamado desde la página pública. Exige número de pedido + email o teléfono
- * para que no se puedan consultar pedidos ajenos.
+ * Exige número de pedido + email o teléfono para que no se puedan
+ * consultar pedidos ajenos.
  */
 function buscarPedido(idIngresado, contacto) {
   const id = String(idIngresado || '').trim().toUpperCase();
@@ -395,35 +443,31 @@ function buscarPedido(idIngresado, contacto) {
   }
   cache.put(claveIntentos, String(intentos + 1), 3600);
 
-  const ss = SpreadsheetApp.getActive();
+  const ss = asegurarHojas_();
   const hoja = ss.getSheetByName(HOJA_PEDIDOS);
-  if (!hoja || hoja.getLastRow() < 2) return generico;
+  if (hoja.getLastRow() < 2) return generico;
 
   const datos = hoja.getRange(2, 1, hoja.getLastRow() - 1, ENCABEZADOS_PEDIDOS.length).getValues();
   const fila = datos.find(function (f) { return String(f[COL.ID - 1]).trim().toUpperCase() === id; });
   if (!fila || !contactoCoincide_(fila, dato)) return generico;
 
   const tz = ss.getSpreadsheetTimeZone();
-  const formato = function (d) {
-    return d instanceof Date ? Utilities.formatDate(d, tz, 'dd/MM/yyyy HH:mm') : '';
-  };
-
+  const p = pedidoDesdeFila_(fila, tz);
   return {
     ok: true,
     pedido: {
-      id: String(fila[COL.ID - 1]),
-      fecha: formato(fila[COL.FECHA - 1]),
-      cliente: String(fila[COL.CLIENTE - 1]).split(' ')[0],
-      productos: String(fila[COL.PRODUCTOS - 1]),
-      estado: String(fila[COL.ESTADO - 1]),
-      mensaje: MENSAJES_ESTADO[String(fila[COL.ESTADO - 1])] || '',
-      transportadora: String(fila[COL.TRANSPORTADORA - 1]),
-      guia: String(fila[COL.GUIA - 1]),
-      nota: String(fila[COL.NOTA - 1]),
-      actualizado: formato(fila[COL.ACTUALIZADO - 1]),
+      id: p.id,
+      fecha: p.fecha,
+      cliente: p.cliente.split(' ')[0],
+      productos: p.productos,
+      estado: p.estado,
+      mensaje: MENSAJES_ESTADO[p.estado] || '',
+      transportadora: p.transportadora,
+      guia: p.guia,
+      nota: p.nota,
+      actualizado: p.actualizado,
       urlRastreo: leerConfig_().URL_RASTREO_TRANSPORTADORA
-    },
-    historial: historialPublico_(ss, String(fila[COL.ID - 1]), formato)
+    }
   };
 }
 
@@ -435,15 +479,6 @@ function contactoCoincide_(fila, contacto) {
   const digitos = c.replace(/\D/g, '');
   const telefono = String(fila[COL.TELEFONO - 1]).replace(/\D/g, '');
   return digitos.length >= 6 && telefono.length >= 6 && telefono.slice(-digitos.length) === digitos;
-}
-
-function historialPublico_(ss, id, formato) {
-  const hoja = ss.getSheetByName(HOJA_HISTORIAL);
-  if (!hoja || hoja.getLastRow() < 2) return [];
-  return hoja.getRange(2, 1, hoja.getLastRow() - 1, ENCABEZADOS_HISTORIAL.length).getValues()
-    .filter(function (f) { return String(f[1]).trim().toUpperCase() === id.toUpperCase() && f[2] === 'Estado'; })
-    .map(function (f) { return { fecha: formato(f[0]), estado: String(f[4]), nota: String(f[5]) }; })
-    .reverse();
 }
 
 /* ===================== Páginas HTML (incluidas en este mismo archivo) ===================== */
@@ -585,39 +620,249 @@ const HTML_SEGUIMIENTO = String.raw`<!DOCTYPE html>
 </html>
 `;
 
-const HTML_NUEVO_PEDIDO = String.raw`<!DOCTYPE html>
+const HTML_ADMIN = String.raw`<!DOCTYPE html>
 <html lang="es">
 <head>
   <base target="_top">
   <meta charset="utf-8">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style> .btn-rosa { background:#ec7fa9; color:#fff; } .btn-rosa:hover { background:#d96a96; color:#fff; } </style>
+  <style>
+    :root { --rosa: #ec7fa9; --rosa-claro: #fdf1f5; }
+    body { background: var(--rosa-claro); font-family: system-ui, sans-serif; }
+    h1, h2 { color: var(--rosa); }
+    .btn-rosa { background: var(--rosa); color: #fff; border-radius: 20px; }
+    .btn-rosa:hover { background: #d96a96; color: #fff; }
+    .caja { border: 0; border-radius: 16px; box-shadow: 0 4px 16px rgba(236,127,169,.15); }
+    .badge-estado { background: var(--rosa); }
+    .badge-Entregado { background: #43a047; } .badge-Cancelado { background: #e53935; }
+  </style>
 </head>
-<body class="p-3">
-<form id="f">
-  <div class="mb-2"><label class="form-label mb-0">Cliente *</label><input name="cliente" class="form-control form-control-sm" required></div>
-  <div class="row g-2 mb-2">
-    <div class="col"><label class="form-label mb-0">Email</label><input name="email" type="email" class="form-control form-control-sm"></div>
-    <div class="col"><label class="form-label mb-0">Teléfono</label><input name="telefono" class="form-control form-control-sm"></div>
+<body>
+<div class="container py-4" style="max-width: 820px">
+  <h1 class="h3 mb-3">Panel de pedidos · <?= tienda ?></h1>
+
+  <!-- Acceso -->
+  <div id="vista-login" class="card caja d-none" style="max-width:380px"><div class="card-body">
+    <h2 id="login-titulo" class="h5"></h2>
+    <p id="login-ayuda" class="small text-muted"></p>
+    <form id="form-login">
+      <input id="clave" type="password" class="form-control mb-2" placeholder="Clave" required autocomplete="current-password">
+      <input id="clave2" type="password" class="form-control mb-2 d-none" placeholder="Repite la clave" autocomplete="new-password">
+      <div id="login-error" class="alert alert-danger py-1 d-none"></div>
+      <button class="btn btn-rosa w-100" type="submit">Entrar</button>
+    </form>
+  </div></div>
+
+  <!-- Panel -->
+  <div id="vista-panel" class="d-none">
+    <div class="text-end mb-2"><button id="salir" class="btn btn-sm btn-outline-secondary">Salir</button></div>
+
+    <div class="card caja mb-4"><div class="card-body">
+      <h2 class="h5">Nuevo pedido</h2>
+      <form id="form-nuevo">
+        <div class="mb-2"><label class="form-label mb-0 small">Cliente *</label><input name="cliente" class="form-control" required></div>
+        <div class="row g-2 mb-2">
+          <div class="col-sm"><label class="form-label mb-0 small">Email</label><input name="email" type="email" class="form-control"></div>
+          <div class="col-sm"><label class="form-label mb-0 small">Teléfono</label><input name="telefono" class="form-control"></div>
+        </div>
+        <div class="mb-2"><label class="form-label mb-0 small">Productos *</label><textarea name="productos" rows="3" class="form-control" required></textarea></div>
+        <div class="row g-2 mb-3">
+          <div class="col-sm-4"><label class="form-label mb-0 small">Total</label><input name="total" type="number" min="0" step="any" class="form-control"></div>
+          <div class="col-sm"><label class="form-label mb-0 small">Dirección / ciudad</label><input name="direccion" class="form-control"></div>
+        </div>
+        <div id="nuevo-msg" class="alert py-1 d-none"></div>
+        <button id="btn-nuevo" class="btn btn-rosa" type="submit">Crear pedido</button>
+      </form>
+    </div></div>
+
+    <div class="d-flex gap-2 mb-3">
+      <input id="buscar" class="form-control" placeholder="Buscar por número, cliente o producto">
+      <select id="filtro" class="form-select" style="max-width:190px"></select>
+    </div>
+    <div id="lista"></div>
   </div>
-  <div class="mb-2"><label class="form-label mb-0">Productos *</label><textarea name="productos" rows="3" class="form-control form-control-sm" required></textarea></div>
-  <div class="mb-2"><label class="form-label mb-0">Total</label><input name="total" type="number" min="0" step="any" class="form-control form-control-sm"></div>
-  <div class="mb-3"><label class="form-label mb-0">Dirección / ciudad</label><input name="direccion" class="form-control form-control-sm"></div>
-  <div id="msg" class="alert alert-danger py-1 d-none"></div>
-  <button id="b" class="btn btn-rosa w-100" type="submit">Crear pedido</button>
-</form>
+</div>
+
 <script>
-  document.getElementById('f').addEventListener('submit', function (ev) {
+  const ESTADOS = <?!= JSON.stringify(estados) ?>;
+  const $ = function (id) { return document.getElementById(id); };
+  let token = null;
+  let pedidos = [];
+  let creandoClave = false;
+
+  try { token = localStorage.getItem('adm_token'); } catch (e) { token = null; }
+
+  function guardarToken(t) {
+    token = t;
+    try { if (t) localStorage.setItem('adm_token', t); else localStorage.removeItem('adm_token'); } catch (e) {}
+  }
+
+  function llamar(nombre, args, ok, fallo) {
+    const r = google.script.run.withSuccessHandler(ok).withFailureHandler(function (e) {
+      if (/SESION/.test(e.message)) { salir(); return; }
+      if (fallo) fallo(e);
+    });
+    r[nombre].apply(r, args);
+  }
+
+  function mostrarLogin() {
+    $('vista-panel').classList.add('d-none');
+    $('vista-login').classList.remove('d-none');
+    llamar('estadoPanel', [], function (s) {
+      creandoClave = !s.claveCreada;
+      $('login-titulo').textContent = creandoClave ? 'Crea tu clave' : 'Entra a tu panel';
+      $('login-ayuda').textContent = creandoClave
+        ? 'Es la primera vez. Elige una clave de al menos 8 caracteres; la usarás siempre para entrar.' : '';
+      $('clave2').classList.toggle('d-none', !creandoClave);
+      $('clave2').required = creandoClave;
+    });
+  }
+
+  function salir() { guardarToken(null); mostrarLogin(); }
+  $('salir').addEventListener('click', salir);
+
+  $('form-login').addEventListener('submit', function (ev) {
     ev.preventDefault();
-    const b = document.getElementById('b'), msg = document.getElementById('msg');
+    const err = $('login-error');
+    err.classList.add('d-none');
+    if (creandoClave && $('clave').value !== $('clave2').value) {
+      err.textContent = 'Las dos claves no coinciden.';
+      err.classList.remove('d-none');
+      return;
+    }
+    const alEntrar = function (t) { guardarToken(t); $('clave').value = ''; $('clave2').value = ''; abrirPanel(); };
+    const alFallar = function (e) { err.textContent = e.message.replace(/^Error: /, ''); err.classList.remove('d-none'); };
+    llamar(creandoClave ? 'crearClave' : 'iniciarSesion', [$('clave').value], alEntrar, alFallar);
+  });
+
+  function abrirPanel() {
+    $('vista-login').classList.add('d-none');
+    $('vista-panel').classList.remove('d-none');
+    cargar();
+  }
+
+  function cargar() {
+    llamar('listarPedidos', [token], function (lista) { pedidos = lista; dibujar(); });
+  }
+
+  /* ---------- Nuevo pedido ---------- */
+  $('form-nuevo').addEventListener('submit', function (ev) {
+    ev.preventDefault();
     const datos = {};
     new FormData(ev.target).forEach(function (v, k) { datos[k] = v; });
-    b.disabled = true; b.textContent = 'Guardando…'; msg.classList.add('d-none');
-    google.script.run
-      .withSuccessHandler(function (id) { alert('Pedido ' + id + ' creado ✅'); google.script.host.close(); })
-      .withFailureHandler(function (e) { b.disabled = false; b.textContent = 'Crear pedido'; msg.textContent = e.message; msg.classList.remove('d-none'); })
-      .crearPedido(datos);
+    const boton = $('btn-nuevo'), msg = $('nuevo-msg');
+    boton.disabled = true; boton.textContent = 'Guardando…'; msg.classList.add('d-none');
+    llamar('crearPedido', [token, datos], function (r) {
+      boton.disabled = false; boton.textContent = 'Crear pedido';
+      ev.target.reset();
+      msg.className = 'alert alert-success py-1';
+      msg.textContent = 'Pedido ' + r.pedido.id + ' creado. Correo: ' + r.correo;
+      pedidos.unshift(r.pedido);
+      dibujar();
+    }, function (e) {
+      boton.disabled = false; boton.textContent = 'Crear pedido';
+      msg.className = 'alert alert-danger py-1';
+      msg.textContent = e.message.replace(/^Error: /, '');
+    });
   });
+
+  /* ---------- Lista ---------- */
+  const filtro = $('filtro');
+  [['', 'Todos los estados']].concat(ESTADOS.map(function (e) { return [e, e]; })).forEach(function (par) {
+    const o = document.createElement('option');
+    o.value = par[0]; o.textContent = par[1];
+    filtro.appendChild(o);
+  });
+  filtro.addEventListener('change', dibujar);
+  $('buscar').addEventListener('input', dibujar);
+
+  function el(tag, clase, texto) {
+    const e = document.createElement(tag);
+    if (clase) e.className = clase;
+    if (texto !== undefined) e.textContent = texto;
+    return e;
+  }
+
+  function dibujar() {
+    const q = $('buscar').value.trim().toLowerCase();
+    const est = filtro.value;
+    const lista = $('lista');
+    lista.textContent = '';
+    const visibles = pedidos.filter(function (p) {
+      if (est && p.estado !== est) return false;
+      return !q || (p.id + ' ' + p.cliente + ' ' + p.productos).toLowerCase().indexOf(q) !== -1;
+    });
+    if (!visibles.length) {
+      lista.appendChild(el('p', 'text-muted text-center', 'No hay pedidos para mostrar.'));
+      return;
+    }
+    visibles.forEach(function (p) { lista.appendChild(tarjeta(p)); });
+  }
+
+  function campo(etiqueta, valor, clase) {
+    const col = el('div', clase);
+    col.appendChild(el('label', 'form-label mb-0 small', etiqueta));
+    const input = el('input', 'form-control form-control-sm');
+    input.value = valor;
+    col.appendChild(input);
+    return { col: col, input: input };
+  }
+
+  function tarjeta(p) {
+    const card = el('div', 'card caja mb-3');
+    const body = el('div', 'card-body');
+    card.appendChild(body);
+
+    const cab = el('div', 'd-flex justify-content-between align-items-start mb-1');
+    const izq = el('div');
+    izq.appendChild(el('b', '', p.id + ' · ' + p.cliente));
+    izq.appendChild(el('div', 'small text-muted', p.fecha + (p.total ? ' · $' + p.total.toLocaleString('es-CO') : '')));
+    cab.appendChild(izq);
+    cab.appendChild(el('span', 'badge badge-estado badge-' + p.estado.replace(/\s/g, ''), p.estado));
+    body.appendChild(cab);
+
+    body.appendChild(el('div', 'small', p.productos));
+    const contacto = [p.email, p.telefono, p.direccion].filter(Boolean).join(' · ');
+    if (contacto) body.appendChild(el('div', 'small text-muted mb-2', contacto));
+
+    const fila = el('div', 'row g-2 mt-1');
+    const colEstado = el('div', 'col-sm-4');
+    colEstado.appendChild(el('label', 'form-label mb-0 small', 'Estado'));
+    const select = el('select', 'form-select form-select-sm');
+    ESTADOS.forEach(function (e) {
+      const o = el('option', '', e); o.value = e; if (e === p.estado) o.selected = true; select.appendChild(o);
+    });
+    colEstado.appendChild(select);
+    const transp = campo('Transportadora', p.transportadora, 'col-sm-4');
+    const guia = campo('Guía', p.guia, 'col-sm-4');
+    fila.appendChild(colEstado); fila.appendChild(transp.col); fila.appendChild(guia.col);
+    body.appendChild(fila);
+
+    const nota = campo('Nota para el cliente (la verá en su seguimiento)', p.nota, 'mt-2');
+    body.appendChild(nota.col);
+
+    const pie = el('div', 'd-flex align-items-center gap-2 mt-2');
+    const boton = el('button', 'btn btn-rosa btn-sm', 'Guardar cambios');
+    const msg = el('span', 'small text-muted');
+    pie.appendChild(boton); pie.appendChild(msg);
+    body.appendChild(pie);
+
+    boton.addEventListener('click', function () {
+      boton.disabled = true; msg.textContent = 'Guardando…';
+      llamar('actualizarPedido', [token, p.id, {
+        estado: select.value, transportadora: transp.input.value, guia: guia.input.value, nota: nota.input.value
+      }], function (r) {
+        const i = pedidos.findIndex(function (x) { return x.id === p.id; });
+        if (i !== -1) pedidos[i] = r.pedido;
+        dibujar();
+      }, function (e) {
+        boton.disabled = false; msg.textContent = e.message.replace(/^Error: /, '');
+      });
+    });
+    return card;
+  }
+
+  if (token) abrirPanel(); else mostrarLogin();
 </script>
 </body>
 </html>
