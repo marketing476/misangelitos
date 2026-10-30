@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    :root { --rosa: #ec7fa9; --rosa-claro: #fdf1f5; }
+    body { background: var(--rosa-claro); font-family: system-ui, sans-serif; }
+    .tarjeta { max-width: 560px; margin: 24px auto; border: 0; border-radius: 20px; box-shadow: 0 6px 24px rgba(236,127,169,.18); }
+    h1 { color: var(--rosa); font-size: 1.5rem; }
+    .btn-rosa { background: var(--rosa); color: #fff; border-radius: 20px; }
+    .btn-rosa:hover { background: #d96a96; color: #fff; }
+    .paso { display: flex; gap: 12px; padding-bottom: 18px; position: relative; }
+    .paso:not(:last-child)::before { content: ''; position: absolute; left: 11px; top: 24px; bottom: 0; width: 2px; background: #e0e0e0; }
+    .punto { width: 24px; height: 24px; border-radius: 50%; background: #e0e0e0; flex: none; }
+    .paso.hecho .punto { background: var(--rosa); }
+    .paso.hecho:not(:last-child)::before { background: var(--rosa); }
+    .paso.actual .punto { box-shadow: 0 0 0 5px rgba(236,127,169,.3); }
+    .paso:not(.hecho) { color: #aaa; }
+  </style>
+</head>
+<body>
+<div class="container px-3">
+  <div class="card tarjeta"><div class="card-body p-4">
+    <h1 class="text-center mb-1"><?= tienda ?></h1>
+    <p class="text-center text-muted">Sigue tu pedido</p>
+
+    <form id="formulario" class="mb-3">
+      <div class="mb-3">
+        <label class="form-label" for="pedido">Número de pedido</label>
+        <input id="pedido" class="form-control" placeholder="MA-0001" required autocomplete="off">
+      </div>
+      <div class="mb-3">
+        <label class="form-label" for="contacto">Tu email o teléfono</label>
+        <input id="contacto" class="form-control" required autocomplete="off">
+      </div>
+      <button id="boton" class="btn btn-rosa w-100" type="submit">Consultar</button>
+    </form>
+
+    <div id="error" class="alert alert-warning d-none"></div>
+
+    <div id="resultado" class="d-none">
+      <hr>
+      <p class="mb-1">Hola <b id="r-cliente"></b> 👋</p>
+      <p id="r-mensaje" class="text-muted"></p>
+      <div id="r-linea" class="my-3"></div>
+      <div class="small">
+        <div><b>Pedido:</b> <span id="r-id"></span></div>
+        <div><b>Productos:</b> <span id="r-productos"></span></div>
+        <div id="r-envio" class="d-none"><b>Envío:</b> <span id="r-transportadora"></span> <span id="r-guia"></span>
+          <a id="r-rastreo" class="d-none" target="_blank" rel="noopener">Rastrear</a></div>
+        <div id="r-nota-fila" class="d-none"><b>Nota:</b> <span id="r-nota"></span></div>
+        <div class="text-muted mt-2">Última actualización: <span id="r-actualizado"></span></div>
+      </div>
+    </div>
+  </div></div>
+</div>
+
+<script>
+  const ESTADOS = <?!= JSON.stringify(estados) ?>;
+  const $ = function (id) { return document.getElementById(id); };
+
+  $('formulario').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    $('boton').disabled = true;
+    $('boton').textContent = 'Buscando…';
+    $('error').classList.add('d-none');
+    $('resultado').classList.add('d-none');
+    google.script.run
+      .withSuccessHandler(mostrar)
+      .withFailureHandler(function () { mostrar({ ok: false, mensaje: 'Ocurrió un error. Inténtalo de nuevo.' }); })
+      .buscarPedido($('pedido').value, $('contacto').value);
+  });
+
+  function mostrar(r) {
+    $('boton').disabled = false;
+    $('boton').textContent = 'Consultar';
+    if (!r.ok) {
+      $('error').textContent = r.mensaje;
+      $('error').classList.remove('d-none');
+      return;
+    }
+    const p = r.pedido;
+    $('r-cliente').textContent = p.cliente;
+    $('r-mensaje').textContent = p.mensaje;
+    $('r-id').textContent = p.id;
+    $('r-productos').textContent = p.productos;
+    $('r-actualizado').textContent = p.actualizado;
+
+    const hayEnvio = p.transportadora || p.guia;
+    $('r-envio').classList.toggle('d-none', !hayEnvio);
+    $('r-transportadora').textContent = p.transportadora;
+    $('r-guia').textContent = p.guia ? '· Guía ' + p.guia : '';
+    const enlace = $('r-rastreo');
+    if (p.urlRastreo && /^https?:\/\//i.test(p.urlRastreo) && p.guia) {
+      enlace.href = p.urlRastreo;
+      enlace.classList.remove('d-none');
+    } else {
+      enlace.classList.add('d-none');
+    }
+    $('r-nota').textContent = p.nota;
+    $('r-nota-fila').classList.toggle('d-none', !p.nota);
+
+    linea(p.estado);
+    $('resultado').classList.remove('d-none');
+  }
+
+  function linea(estadoActual) {
+    const cont = $('r-linea');
+    cont.textContent = '';
+    if (estadoActual === 'Cancelado') {
+      const aviso = document.createElement('div');
+      aviso.className = 'alert alert-danger mb-0';
+      aviso.textContent = 'Pedido cancelado';
+      cont.appendChild(aviso);
+      return;
+    }
+    const idx = ESTADOS.indexOf(estadoActual);
+    ESTADOS.forEach(function (estado, i) {
+      const paso = document.createElement('div');
+      paso.className = 'paso' + (i <= idx ? ' hecho' : '') + (i === idx ? ' actual' : '');
+      const punto = document.createElement('div');
+      punto.className = 'punto';
+      const texto = document.createElement('div');
+      texto.textContent = estado;
+      if (i === idx) texto.style.fontWeight = '600';
+      paso.appendChild(punto);
+      paso.appendChild(texto);
+      cont.appendChild(paso);
+    });
+  }
+</script>
+</body>
+</html>
